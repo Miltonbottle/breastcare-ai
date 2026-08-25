@@ -67,15 +67,22 @@ class BreastCareAgent:
             "Invalid image",
             status_code=400,
         )
+        trace[-1].details = {
+            "source_size": f"{validated_image['width']}x{validated_image['height']}",
+            "reason": "Image decoded and preprocessed using the inference pipeline.",
+        }
         decision = self._run_step(
             trace,
             "decide_segmentation",
             lambda: tools.decide_segmentation(validated_image),
             "Segmentation decision failed",
         )
+        trace[-1].details = {
+            "decision": "segment" if decision["should_segment"] else "stop",
+            "reason": decision["reason"],
+        }
         if not decision["should_segment"]:
             trace[-1].status = "stopped"
-            trace[-1].details = {"reason": decision["reason"]}
             raise AgentWorkflowError(decision["reason"], 422, trace)
 
         segmentation = self._run_step(
@@ -86,20 +93,26 @@ class BreastCareAgent:
                 self.device,
                 self.model_lock,
                 validated_image,
-                image_path,
-                self.output_dir,
             ),
             "Model inference failure",
         )
+        trace[-1].details = {
+            "mask_size": f"{segmentation['mask'].shape[1]}x{segmentation['mask'].shape[0]}",
+            "inference_time_seconds": round(segmentation["inference_seconds"], 4),
+        }
         usable_mask = self._run_step(
             trace,
             "check_usable_mask",
             lambda: tools.check_usable_mask(segmentation["mask"]),
             "Mask validation failure",
         )
+        trace[-1].details = {
+            "decision": "continue" if usable_mask["usable"] else "stop",
+            "reason": usable_mask.get("reason", "Foreground mask is present."),
+            "foreground_pixels": usable_mask.get("foreground_pixels", 0),
+        }
         if not usable_mask["usable"]:
             trace[-1].status = "stopped"
-            trace[-1].details = {"reason": usable_mask["reason"]}
             raise AgentWorkflowError(usable_mask["reason"], 422, trace)
 
         features = self._run_step(
@@ -108,18 +121,42 @@ class BreastCareAgent:
             lambda: tools.extract_features(segmentation["mask"]),
             "Feature extraction failure",
         )
-        analysis = self._run_step(
-            trace,
-            "analyze_geometry",
-            lambda: tools.analyze_geometry(features),
-            "Geometry analysis failure",
-        )
+        trace[-1].details = {
+            "primary_area_percentage": round(features["lesion_area_percentage"], 4),
+            "connected_components": features["connected_components"],
+        }
         quality = self._run_step(
             trace,
             "quality_check",
             lambda: tools.quality_check(segmentation["mask"], features),
             "Segmentation quality check failure",
         )
+        trace[-1].details = {
+            "decision": quality["outcome"],
+            "reason": quality["reason"],
+            "flag_count": len(quality["flags"]),
+        }
+        analysis = self._run_step(
+            trace,
+            "analyze_geometry",
+            lambda: tools.analyze_geometry(features),
+            "Geometry analysis failure",
+        )
+        trace[-1].details = {
+            "reason": "Geometry analysis generated from extracted mask features.",
+        }
+        output_paths = self._run_step(
+            trace,
+            "save_segmentation_outputs",
+            lambda: tools.save_segmentation_outputs(
+                validated_image, segmentation["mask"], image_path, self.output_dir
+            ),
+            "Output artifact failure",
+        )
+        segmentation["output_paths"] = output_paths
+        trace[-1].details = {
+            "reason": "Usable segmentation artifacts saved for review.",
+        }
         report = self._run_step(
             trace,
             "generate_report",
@@ -128,6 +165,10 @@ class BreastCareAgent:
             ),
             "Report generation failure",
         )
+        trace[-1].details = {
+            "outcome": quality["outcome"],
+            "reason": "Structured report assembled after quality routing.",
+        }
         report["agent_trace"] = {
             "agent": self.name,
             "steps": [step.to_dict() for step in trace],

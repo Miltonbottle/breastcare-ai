@@ -23,18 +23,31 @@ def validate_image(image_path: str | Path) -> dict[str, Any]:
         "image_tensor": image_tensor,
         "width": int(original_rgb.shape[1]),
         "height": int(original_rgb.shape[0]),
+        "pixel_std": float(np.std(original_rgb)),
     }
 
 
 def decide_segmentation(validated_image: dict[str, Any]) -> dict[str, Any]:
-    """Make the bounded decision to segment a successfully validated image."""
+    """Decide whether the validated image meets minimum workflow conditions."""
     image_tensor = validated_image["image_tensor"]
-    should_segment = tuple(image_tensor.shape) == (1, 3, 256, 256)
+    if tuple(image_tensor.shape) != (1, 3, 256, 256):
+        return {
+            "should_segment": False,
+            "reason": "Preprocessed image does not match the model input contract.",
+        }
+    if min(validated_image["width"], validated_image["height"]) < 64:
+        return {
+            "should_segment": False,
+            "reason": "Source image resolution is below the 64-pixel minimum workflow threshold.",
+        }
+    if validated_image["pixel_std"] <= 1.0:
+        return {
+            "should_segment": False,
+            "reason": "Source image has insufficient pixel variation for segmentation review.",
+        }
     return {
-        "should_segment": should_segment,
-        "reason": "Image passed validation and matches the model input contract."
-        if should_segment
-        else "Image does not match the expected model input contract.",
+        "should_segment": True,
+        "reason": "Image passed input-contract, resolution, and pixel-variation checks.",
     }
 
 
@@ -43,10 +56,8 @@ def run_segmentation(
     device: torch.device,
     model_lock: threading.Lock,
     validated_image: dict[str, Any],
-    image_path: str | Path,
-    output_dir: str | Path,
 ) -> dict[str, Any]:
-    """Run the already-loaded model and save output artifacts through inference.py."""
+    """Run the already-loaded model using the existing inference output logic."""
     image_tensor = validated_image["image_tensor"].to(device)
     with model_lock, torch.no_grad():
         if device.type == "cuda":
@@ -59,12 +70,8 @@ def run_segmentation(
         inference_seconds = time.perf_counter() - start_time
 
     mask = binary_mask[0, 0].cpu().numpy()
-    output_paths = save_outputs(
-        validated_image["original_rgb"], mask, Path(image_path), Path(output_dir)
-    )
     return {
         "mask": mask,
-        "output_paths": output_paths,
         "inference_seconds": inference_seconds,
     }
 
@@ -100,7 +107,7 @@ def analyze_geometry(features: dict[str, Any]) -> dict[str, Any]:
 
 
 def quality_check(mask: np.ndarray, features: dict[str, Any]) -> dict[str, Any]:
-    """Perform transparent mask sanity checks without clinical interpretation."""
+    """Route mask geometry to accepted or review-required before reporting."""
     area_percentage = float(features["lesion_area_percentage"])
     components = int(features["connected_components"])
     flags: list[str] = []
@@ -111,12 +118,31 @@ def quality_check(mask: np.ndarray, features: dict[str, Any]) -> dict[str, Any]:
     if components > 1:
         flags.append("Multiple foreground components; the largest component drives geometry.")
 
+    outcome = "review_required" if flags else "accepted"
     return {
         "status": "review_required" if flags else "passed",
+        "outcome": outcome,
+        "reason": (
+            "One or more segmentation sanity checks require review."
+            if flags
+            else "Mask passed configured segmentation sanity checks."
+        ),
         "mask_dimensions": {"width": int(mask.shape[1]), "height": int(mask.shape[0])},
         "foreground_pixels": int(np.count_nonzero(mask)),
         "flags": flags,
     }
+
+
+def save_segmentation_outputs(
+    validated_image: dict[str, Any],
+    mask: np.ndarray,
+    image_path: str | Path,
+    output_dir: str | Path,
+) -> dict[str, Path]:
+    """Save artifacts only after the mask has passed usability checks."""
+    return save_outputs(
+        validated_image["original_rgb"], mask, Path(image_path), Path(output_dir)
+    )
 
 
 def generate_report(
@@ -135,4 +161,5 @@ def generate_report(
         "features": features,
         "analysis": analysis,
         "segmentation_quality": quality,
+        "workflow_outcome": quality["outcome"],
     }
